@@ -19,9 +19,10 @@ type SSHProfile struct {
 }
 
 const (
-	configFile = ".ssh-profiles"
-	sshDir     = ".ssh"
-	version    = "1.0.0"
+	configFile        = ".ssh-profiles"
+	folderConfigFile  = ".ssh-folder-profiles"
+	sshDir            = ".ssh"
+	version           = "1.0.0"
 )
 
 func main() {
@@ -45,6 +46,16 @@ func main() {
 		switchProfile(os.Args[2])
 	case "current":
 		showCurrentProfile()
+	case "assign":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: sshm assign <profile-name>")
+			return
+		}
+		assignFolder(os.Args[2])
+	case "unassign":
+		unassignFolder()
+	case "assigned":
+		showAssigned()
 	case "delete":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: sshm delete <profile-name>")
@@ -65,12 +76,17 @@ func printUsage() {
 	fmt.Println("  sshm list             - List all profiles")
 	fmt.Println("  sshm switch <name>    - Switch to a profile")
 	fmt.Println("  sshm current          - Show current active profile")
+	fmt.Println("  sshm assign <name>    - Assign current folder to a profile")
+	fmt.Println("  sshm unassign         - Remove profile assignment from current folder")
+	fmt.Println("  sshm assigned         - Show profile assigned to current folder")
 	fmt.Println("  sshm delete <name>    - Delete a profile")
 	fmt.Println("  sshm version          - Show version")
 	fmt.Println("\nExamples:")
 	fmt.Println("  sshm new")
 	fmt.Println("  sshm switch work")
 	fmt.Println("  sshm switch personal")
+	fmt.Println("  sshm assign work       # use 'work' profile in this folder")
+	fmt.Println("  sshm unassign          # remove folder assignment")
 }
 
 func getHomeDir() string {
@@ -500,4 +516,178 @@ func deleteProfile(profileName string) {
 	}
 	
 	fmt.Printf("✅ Profile '%s' deleted successfully.\n", profileName)
+}
+
+func getFolderConfigPath() string {
+	return filepath.Join(getHomeDir(), folderConfigFile)
+}
+
+func loadFolderMappings() map[string]string {
+	mappings := make(map[string]string)
+	file, err := os.Open(getFolderConfigPath())
+	if err != nil {
+		return mappings
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) == 2 {
+			mappings[parts[0]] = parts[1]
+		}
+	}
+	return mappings
+}
+
+func saveFolderMappings(mappings map[string]string) {
+	file, err := os.Create(getFolderConfigPath())
+	if err != nil {
+		fmt.Println("Error saving folder mappings:", err)
+		return
+	}
+	defer file.Close()
+
+	for folder, profile := range mappings {
+		fmt.Fprintf(file, "%s|%s\n", folder, profile)
+	}
+}
+
+func assignFolder(profileName string) {
+	profiles := loadProfiles()
+
+	var selectedProfile *SSHProfile
+	for _, profile := range profiles {
+		if profile.Name == profileName {
+			selectedProfile = &profile
+			break
+		}
+	}
+
+	if selectedProfile == nil {
+		fmt.Printf("Profile '%s' not found. Use 'sshm list' to see available profiles.\n", profileName)
+		return
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Println("Error getting current directory:", err)
+		return
+	}
+
+	// Check if this is a git repository
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = cwd
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Println("Current directory is not a git repository.")
+		fmt.Println("Run this command from inside a git repo.")
+		return
+	}
+	repoRoot := strings.TrimSpace(string(output))
+
+	// Set local git config
+	sshCmd := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes", selectedProfile.KeyPath)
+	cmds := [][]string{
+		{"git", "config", "--local", "user.name", selectedProfile.Username},
+		{"git", "config", "--local", "user.email", selectedProfile.Email},
+		{"git", "config", "--local", "core.sshCommand", sshCmd},
+	}
+
+	for _, args := range cmds {
+		c := exec.Command(args[0], args[1:]...)
+		c.Dir = repoRoot
+		if err := c.Run(); err != nil {
+			fmt.Printf("Error setting git config (%s): %s\n", args[2], err)
+			return
+		}
+	}
+
+	// Save the mapping
+	mappings := loadFolderMappings()
+	mappings[repoRoot] = profileName
+	saveFolderMappings(mappings)
+
+	fmt.Printf("Folder assigned to profile '%s'\n", profileName)
+	fmt.Printf("  Path:     %s\n", repoRoot)
+	fmt.Printf("  Username: %s\n", selectedProfile.Username)
+	fmt.Printf("  Email:    %s\n", selectedProfile.Email)
+	fmt.Printf("  SSH Key:  %s\n", selectedProfile.KeyPath)
+}
+
+func unassignFolder() {
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Println("Error getting current directory:", err)
+		return
+	}
+
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = cwd
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Println("Current directory is not a git repository.")
+		return
+	}
+	repoRoot := strings.TrimSpace(string(output))
+
+	// Unset local git config
+	configs := []string{"user.name", "user.email", "core.sshCommand"}
+	for _, key := range configs {
+		c := exec.Command("git", "config", "--local", "--unset", key)
+		c.Dir = repoRoot
+		c.Run() // ignore errors if key doesn't exist
+	}
+
+	// Remove from mappings
+	mappings := loadFolderMappings()
+	if _, exists := mappings[repoRoot]; exists {
+		delete(mappings, repoRoot)
+		saveFolderMappings(mappings)
+		fmt.Printf("Removed profile assignment from: %s\n", repoRoot)
+	} else {
+		fmt.Println("No profile assignment found for this folder.")
+	}
+}
+
+func showAssigned() {
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Println("Error getting current directory:", err)
+		return
+	}
+
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = cwd
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Println("Current directory is not a git repository.")
+		return
+	}
+	repoRoot := strings.TrimSpace(string(output))
+
+	mappings := loadFolderMappings()
+	profileName, exists := mappings[repoRoot]
+	if !exists {
+		fmt.Println("No profile assigned to this folder.")
+		fmt.Println("Use 'sshm assign <profile>' to assign one.")
+		return
+	}
+
+	profiles := loadProfiles()
+	for _, profile := range profiles {
+		if profile.Name == profileName {
+			fmt.Printf("Folder: %s\n", repoRoot)
+			fmt.Printf("Profile: %s\n", profile.Name)
+			fmt.Printf("  Username: %s\n", profile.Username)
+			fmt.Printf("  Email:    %s\n", profile.Email)
+			fmt.Printf("  Host:     %s\n", profile.Host)
+			fmt.Printf("  SSH Key:  %s\n", profile.KeyPath)
+			return
+		}
+	}
+
+	fmt.Printf("Folder is assigned to profile '%s', but that profile no longer exists.\n", profileName)
+	fmt.Println("Use 'sshm assign <profile>' to reassign or 'sshm unassign' to clear.")
 }
